@@ -36,12 +36,17 @@ action:
   - alias: "Turn on the light"
     service: homeassistant.turn_on
     entity_id: !input light_target
-  - alias: "Wait until there is no motion from device"
-    wait_for_trigger:
-      platform: state
-      entity_id: !input motion_entity
-      from: "on"
-      to: "off"
+  - alias: "Wait until there is no motion from device (skip if already off due to sensor chatter)"
+    if:
+      - condition: state
+        entity_id: !input motion_entity
+        state: "on"
+    then:
+      - wait_for_trigger:
+          platform: state
+          entity_id: !input motion_entity
+          from: "on"
+          to: "off"
   - alias: "Wait the number of seconds that has been set"
     delay: !input no_motion_wait
   - alias: "Turn off the light"

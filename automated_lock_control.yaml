@@ -5,13 +5,20 @@ blueprint:
   name: Automated lock control
   description: Locks the door when closed for a variable amount of time or unlocks when open to allow the door to close properly
   domain: automation
+  source_url: https://github.com/kenmaca/ha-blueprints/blob/main/automated_lock_control.yaml
+  author: kenmaca
   input:
     door:
       name: Door
       selector:
         entity:
           domain: binary_sensor
-          
+          device_class:
+            - door
+            - garage_door
+            - opening
+            - window
+
     lock:
       name: Lock
       selector:
@@ -20,48 +27,100 @@ blueprint:
 
     ttl:
       name: Time-to-lock
+      description: Seconds the door must stay closed (or the lock left unlocked) before auto-locking.
       default: 10
       selector:
         number:
-          min: 0
+          min: 1
           max: 300
           step: 1
           unit_of_measurement: 'seconds'
           mode: slider
-    
+
     ttu:
       name: Time-to-unlock
+      description: Seconds the lock can remain locked while the door is open before auto-unlocking to prevent the bolt from jamming.
       default: 120
       selector:
         number:
-          min: 0
+          min: 1
           max: 300
           step: 1
           unit_of_measurement: 'seconds'
           mode: slider
 
-mode: single
+    enable_auto_lock:
+      name: Enable auto-lock
+      description: Automatically lock the door when it's been closed (or the lock left unlocked) for the configured time.
+      default: true
+      selector:
+        boolean:
+
+    enable_auto_unlock:
+      name: Enable auto-unlock
+      description: Automatically unlock when the door is open and the lock has been engaged for too long, to prevent jamming.
+      default: true
+      selector:
+        boolean:
+
+mode: restart
 
 trigger:
+  # Lock has been locked for ttu — check if door is open (jam risk).
   - platform: state
     entity_id: !input lock
     to: 'locked'
+    not_from:
+      - 'unavailable'
+      - 'unknown'
     for:
       seconds: !input ttu
+  # Door has been open for ttu while lock is locked — also a jam risk.
+  - platform: state
+    entity_id: !input door
+    to: 'on'
+    not_from:
+      - 'unavailable'
+      - 'unknown'
+    for:
+      seconds: !input ttu
+  # Door has been closed for ttl — auto-lock candidate.
   - platform: state
     entity_id: !input door
     to: 'off'
+    not_from:
+      - 'unavailable'
+      - 'unknown'
     for:
       seconds: !input ttl
+  # Lock has been unlocked for ttl while door stayed closed — auto-lock candidate.
   - platform: state
     entity_id: !input lock
     to: 'unlocked'
+    not_from:
+      - 'unavailable'
+      - 'unknown'
     for:
       seconds: !input ttl
 
+# Bail out if either entity is in a degraded state — no point acting on stale data.
+condition:
+  - condition: not
+    conditions:
+      - condition: state
+        entity_id: !input door
+        state:
+          - 'unavailable'
+          - 'unknown'
+      - condition: state
+        entity_id: !input lock
+        state:
+          - 'unavailable'
+          - 'unknown'
+
 action:
   - choose:
-    - alias: 'Unlock when door locked and open to prevent getting stuck after ttu'
+    - alias: 'Unlock when door open and lock locked to prevent jamming'
       conditions:
         - condition: state
           entity_id: !input door
@@ -69,10 +128,13 @@ action:
         - condition: state
           entity_id: !input lock
           state: 'locked'
+        - condition: template
+          value_template: "{{ enable_auto_unlock }}"
       sequence:
-        - service: lock.unlock
-          entity_id: !input lock
-    - alias: 'Automatically lock on door closed for ttl'
+        - action: lock.unlock
+          target:
+            entity_id: !input lock
+    - alias: 'Automatically lock when door closed and lock unlocked'
       conditions:
         - condition: state
           entity_id: !input door
@@ -80,6 +142,9 @@ action:
         - condition: state
           entity_id: !input lock
           state: 'unlocked'
+        - condition: template
+          value_template: "{{ enable_auto_lock }}"
       sequence:
-        - service: lock.lock
-          entity_id: !input lock
+        - action: lock.lock
+          target:
+            entity_id: !input lock

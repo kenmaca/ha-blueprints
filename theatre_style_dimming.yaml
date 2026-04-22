@@ -31,8 +31,21 @@ blueprint:
           unit_of_measurement: "%"
           mode: slider
 
+    brightness_threshold:
+      name: Brightness Threshold
+      description: Only dim if the current light brightness is above this level. Prevents re-dimming an already-dim light.
+      default: 20
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 5
+          unit_of_measurement: "%"
+          mode: slider
+
     ttd:
       name: Time-to-dim
+      description: Delay after media starts playing before dimming begins.
       default: 3
       selector:
         number:
@@ -44,6 +57,7 @@ blueprint:
 
     ttr:
       name: Time-to-reset
+      description: Delay after media stops/pauses before restoring brightness. Smooths over brief pauses and buffering.
       default: 10
       selector:
         number:
@@ -55,6 +69,7 @@ blueprint:
 
     dim_duration:
       name: Dim Duration
+      description: Transition time for both dim and restore.
       default: 2
       selector:
         number:
@@ -68,6 +83,7 @@ mode: single
 
 variables:
   room_light: !input room_light
+  brightness_threshold: !input brightness_threshold
 
 trigger:
   - platform: state
@@ -77,25 +93,26 @@ trigger:
       seconds: !input ttd
   - platform: state
     entity_id: !input media_player
+    to: "buffering"
+    for:
+      seconds: !input ttd
+  - platform: state
+    entity_id: !input media_player
     to: "on"
     for:
       seconds: !input ttd
 
 condition:
-  - condition: numeric_state
-    entity_id: !input room_light
+  - condition: template
     value_template: >
-      {% if is_state(room_light, 'on') %}
-        {{ states[room_light].attributes.brightness }}
-      {% else %}
-        0
-      {% endif %}
-    above: 50
+      {{ is_state(room_light, 'on')
+         and (state_attr(room_light, 'brightness') | int(0))
+             > (brightness_threshold * 255 / 100) }}
 
 action:
   - service: scene.create
-    data_template:
-      scene_id: persistence_{{ room_light.split('.')[1] }}
+    data:
+      scene_id: "persistence_{{ room_light.split('.')[1] }}"
       snapshot_entities: !input room_light
   - service: light.turn_on
     data:
@@ -109,6 +126,8 @@ action:
       - platform: state
         entity_id: !input media_player
         to: "paused"
+        for:
+          seconds: !input ttr
       - platform: state
         entity_id: !input media_player
         to: "idle"
@@ -127,9 +146,11 @@ action:
       - platform: state
         entity_id: !input room_light
         to: "off"
-  - service: scene.turn_on
-    data_template:
-      entity_id: scene.persistence_{{ room_light.split('.')[1] }}
-      transition: !input dim_duration
-  - delay:
-      seconds: !input dim_duration
+  - if:
+      - condition: template
+        value_template: "{{ wait.trigger.to_state.entity_id != room_light }}"
+    then:
+      - service: scene.turn_on
+        data:
+          entity_id: "scene.persistence_{{ room_light.split('.')[1] }}"
+          transition: !input dim_duration

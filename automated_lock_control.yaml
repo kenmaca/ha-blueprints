@@ -63,6 +63,13 @@ blueprint:
       selector:
         boolean:
 
+# Expose boolean inputs to Jinja so the template conditions below can read them.
+# Without this, `!input` values aren't visible inside `{{ ... }}` and the gates
+# silently evaluate to an empty string (falsy), blocking every action.
+variables:
+  enable_auto_lock: !input enable_auto_lock
+  enable_auto_unlock: !input enable_auto_unlock
+
 mode: restart
 
 trigger:

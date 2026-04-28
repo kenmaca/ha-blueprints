@@ -1,9 +1,21 @@
 #
-# Locks the door when closed for a variable amount of time or unlocks when open to allow the door to close properly
+# Auto-locks the door after it's been closed (or the lock left unlocked) for some time,
+# and optionally auto-unlocks when the door is held open with the deadbolt extended.
+#
+# Designed to be friendly to Yale's flaky/rate-limited cloud:
+#   * mode: single (no in-flight cancellation, no duplicate API calls)
+#   * idempotent actions — duplicate triggers no-op safely
+#   * each lock/unlock is verified by waiting for the entity state to confirm
+#   * a single retry after a backoff handles the "Yale didn't respond" case
 
 blueprint:
   name: Automated lock control
-  description: Locks the door when closed for a variable amount of time or unlocks when open to allow the door to close properly
+  description: >-
+    Auto-locks the door when it's been closed (or the lock left unlocked) for the
+    configured time. Optionally auto-unlocks when the door is held open with the
+    deadbolt extended, to prevent jamming. Each command is verified by waiting for
+    the lock state to confirm, with a single retry on failure — written to play
+    nicely with rate-limited cloud-backed locks (e.g. Yale).
   domain: automation
   source_url: https://github.com/kenmaca/ha-blueprints/blob/main/automated_lock_control.yaml
   author: kenmaca
@@ -28,11 +40,11 @@ blueprint:
     ttl:
       name: Time-to-lock
       description: Seconds the door must stay closed (or the lock left unlocked) before auto-locking.
-      default: 10
+      default: 60
       selector:
         number:
           min: 1
-          max: 300
+          max: 600
           step: 1
           unit_of_measurement: 'seconds'
           mode: slider
@@ -44,8 +56,37 @@ blueprint:
       selector:
         number:
           min: 1
-          max: 300
+          max: 600
           step: 1
+          unit_of_measurement: 'seconds'
+          mode: slider
+
+    verify_timeout:
+      name: Verification timeout
+      description: >-
+        Seconds to wait for the lock to confirm the new state after a command is
+        issued. Yale can take 30s+ under load — keep this generous.
+      default: 45
+      selector:
+        number:
+          min: 5
+          max: 180
+          step: 5
+          unit_of_measurement: 'seconds'
+          mode: slider
+
+    retry_backoff:
+      name: Retry backoff
+      description: >-
+        Seconds to wait before retrying once if the lock didn't confirm. Long
+        enough to clear most rate-limit windows, short enough that the door
+        doesn't sit in the wrong state for too long.
+      default: 60
+      selector:
+        number:
+          min: 5
+          max: 600
+          step: 5
           unit_of_measurement: 'seconds'
           mode: slider
 
@@ -63,18 +104,30 @@ blueprint:
       selector:
         boolean:
 
-# Expose boolean inputs to Jinja so the template conditions below can read them.
-# Without this, `!input` values aren't visible inside `{{ ... }}` and the gates
-# silently evaluate to an empty string (falsy), blocking every action.
+# Surface inputs to Jinja so action templates and wait_templates can reference them.
+# Without this, `!input` values aren't visible inside `{{ ... }}`.
 variables:
   enable_auto_lock: !input enable_auto_lock
   enable_auto_unlock: !input enable_auto_unlock
+  door_entity: !input door
+  lock_entity: !input lock
+  verify_timeout: !input verify_timeout
+  retry_backoff: !input retry_backoff
 
-mode: restart
+# `mode: single` is load-bearing here. With `mode: restart`, a second trigger that
+# arrived while a `lock.lock` call was in-flight would cancel the HA task — but the
+# request was usually already on its way to Yale's cloud, and we'd issue a second
+# request on top of it. Yale would respond with error 560 / TimeoutError. With
+# single, the first run wins, runs to completion, and any near-simultaneous
+# triggers are dropped silently. The action is idempotent (it inspects current
+# state before doing anything), so dropping duplicates is safe.
+mode: single
+max_exceeded: silent
 
 trigger:
-  # Lock has been locked for ttu — check if door is open (jam risk).
+  # Lock has been locked for ttu while the door is open — bolt-jam risk.
   - platform: state
+    id: lock_locked_for_ttu
     entity_id: !input lock
     to: 'locked'
     not_from:
@@ -82,8 +135,9 @@ trigger:
       - 'unknown'
     for:
       seconds: !input ttu
-  # Door has been open for ttu while lock is locked — also a jam risk.
+  # Door has been open for ttu while the lock is locked — also a jam risk.
   - platform: state
+    id: door_open_for_ttu
     entity_id: !input door
     to: 'on'
     not_from:
@@ -93,6 +147,7 @@ trigger:
       seconds: !input ttu
   # Door has been closed for ttl — auto-lock candidate.
   - platform: state
+    id: door_closed_for_ttl
     entity_id: !input door
     to: 'off'
     not_from:
@@ -100,8 +155,10 @@ trigger:
       - 'unknown'
     for:
       seconds: !input ttl
-  # Lock has been unlocked for ttl while door stayed closed — auto-lock candidate.
+  # Lock has been unlocked for ttl — auto-lock candidate (covers the "unlocked but
+  # never opened the door" case).
   - platform: state
+    id: lock_unlocked_for_ttl
     entity_id: !input lock
     to: 'unlocked'
     not_from:
@@ -110,7 +167,7 @@ trigger:
     for:
       seconds: !input ttl
 
-# Bail out if either entity is in a degraded state — no point acting on stale data.
+# Bail out if either entity is degraded — no point acting on stale data.
 condition:
   - condition: not
     conditions:
@@ -127,31 +184,82 @@ condition:
 
 action:
   - choose:
-    - alias: 'Unlock when door open and lock locked to prevent jamming'
+    - alias: 'Auto-unlock — door open while locked, retract the bolt'
       conditions:
+        - condition: template
+          value_template: "{{ enable_auto_unlock }}"
         - condition: state
           entity_id: !input door
           state: 'on'
         - condition: state
           entity_id: !input lock
           state: 'locked'
-        - condition: template
-          value_template: "{{ enable_auto_unlock }}"
       sequence:
-        - action: lock.unlock
+        - alias: 'Issue unlock'
+          action: lock.unlock
           target:
             entity_id: !input lock
-    - alias: 'Automatically lock when door closed and lock unlocked'
+          # Yale sometimes raises 560/TimeoutError but the lock did move — let
+          # the wait_template below decide based on actual state, not the call.
+          continue_on_error: true
+        - alias: 'Wait for the lock to confirm unlocked'
+          wait_template: "{{ is_state(lock_entity, 'unlocked') }}"
+          timeout:
+            seconds: !input verify_timeout
+          continue_on_timeout: true
+        - alias: 'Retry once if Yale didn''t respond and the door is still open'
+          if:
+            - condition: template
+              value_template: >-
+                {{ is_state(door_entity, 'on') and is_state(lock_entity, 'locked') }}
+          then:
+            - delay:
+                seconds: !input retry_backoff
+            - alias: 'Re-issue unlock'
+              action: lock.unlock
+              target:
+                entity_id: !input lock
+              continue_on_error: true
+            - wait_template: "{{ is_state(lock_entity, 'unlocked') }}"
+              timeout:
+                seconds: !input verify_timeout
+              continue_on_timeout: true
+
+    - alias: 'Auto-lock — door closed and lock left unlocked'
       conditions:
+        - condition: template
+          value_template: "{{ enable_auto_lock }}"
         - condition: state
           entity_id: !input door
           state: 'off'
         - condition: state
           entity_id: !input lock
           state: 'unlocked'
-        - condition: template
-          value_template: "{{ enable_auto_lock }}"
       sequence:
-        - action: lock.lock
+        - alias: 'Issue lock'
+          action: lock.lock
           target:
             entity_id: !input lock
+          continue_on_error: true
+        - alias: 'Wait for the lock to confirm locked'
+          wait_template: "{{ is_state(lock_entity, 'locked') }}"
+          timeout:
+            seconds: !input verify_timeout
+          continue_on_timeout: true
+        - alias: 'Retry once if Yale didn''t respond and the door is still closed'
+          if:
+            - condition: template
+              value_template: >-
+                {{ is_state(door_entity, 'off') and is_state(lock_entity, 'unlocked') }}
+          then:
+            - delay:
+                seconds: !input retry_backoff
+            - alias: 'Re-issue lock'
+              action: lock.lock
+              target:
+                entity_id: !input lock
+              continue_on_error: true
+            - wait_template: "{{ is_state(lock_entity, 'locked') }}"
+              timeout:
+                seconds: !input verify_timeout
+              continue_on_timeout: true

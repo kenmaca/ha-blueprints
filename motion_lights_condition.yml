@@ -1,20 +1,27 @@
 blueprint:
   name: Motion-activated Light with external binary sensor condition
-  description: Turn on a light when motion is detected and an external binary sensor is on
+  description: >-
+    Turn on a light when motion is detected and an external binary sensor is on.
+    v2 (restart-safe): the turn-off is a state trigger with a `for:` duration
+    instead of an in-flight wait/delay, so it survives Home Assistant restarts
+    and automation reloads. The turn-off is also unconditional — it fires even
+    if the condition entity (e.g. dusk) has since turned off, so lights can't
+    get stuck on by a condition flip mid-cycle.
   domain: automation
+  source_url: https://github.com/kenmaca/ha-blueprints/blob/main/motion_lights_condition.yml
   input:
     motion_entity:
       name: Motion Sensor
       selector:
-        entity:
+        entity: {}
     light_target:
       name: Light
       selector:
-        entity:
+        entity: {}
     condition_entity:
       name: Binary Sensor
       selector:
-        entity:
+        entity: {}
     no_motion_wait:
       name: Wait time
       description: Time to leave the light on after last motion is detected
@@ -24,37 +31,40 @@ blueprint:
           min: 0
           max: 3600
           unit_of_measurement: seconds
+          step: 1
+          mode: slider
 
-# If motion is detected within the delay,
-# we restart the script.
 mode: restart
 max_exceeded: silent
 
-trigger:
-  platform: state
-  entity_id: !input motion_entity
-  from: "off"
-  to: "on"
-  
-condition:
-  - condition: state
-    entity_id: !input condition_entity
-    state: "on"
+triggers:
+  - trigger: state
+    entity_id: !input motion_entity
+    to: "on"
+    id: motion_on
+  - trigger: state
+    entity_id: !input motion_entity
+    to: "off"
+    for:
+      seconds: !input no_motion_wait
+    id: motion_off
 
-action:
-  - service: homeassistant.turn_on
-    entity_id: !input light_target
-  - alias: "Wait until there is no motion from device (skip if already off due to sensor chatter)"
-    if:
-      - condition: state
-        entity_id: !input motion_entity
-        state: "on"
-    then:
-      - wait_for_trigger:
-          platform: state
-          entity_id: !input motion_entity
-          from: "on"
-          to: "off"
-  - delay: !input no_motion_wait
-  - service: homeassistant.turn_off
-    entity_id: !input light_target
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: motion_on
+          - condition: state
+            entity_id: !input condition_entity
+            state: "on"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: !input light_target
+      - conditions:
+          - condition: trigger
+            id: motion_off
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: !input light_target

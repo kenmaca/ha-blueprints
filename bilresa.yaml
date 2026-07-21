@@ -11,7 +11,7 @@ blueprint:
         device:
           integration: mqtt
           manufacturer: IKEA
-          model: "BILRESA remote control with buttons (Matter) (E2489)"
+          model: "BILRESA remote control with buttons (Matter)"
     action_on:
       name: 🔼 Up Button - Single press
       default: []

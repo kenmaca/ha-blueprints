@@ -1,7 +1,18 @@
 blueprint:
   name: Motion-activated Light with sun condition
-  description: Turn on a light when motion is detected and sunset.
+  description: >-
+    Turn on a light when motion is detected while it is dark, and turn it off
+    once motion has been clear for the wait time.
+
+    Turning on and turning off are driven by separate triggers, so the
+    automation never holds an open run between the two. Nothing is left
+    dangling if the automation is reloaded, restarted, or interrupted
+    mid-delay. The sun condition gates only the turn-on branch — the light
+    still turns off after sunrise.
   domain: automation
+  source_url: https://github.com/kenmaca/ha-blueprints/blob/main/motion_lights_night.yaml
+  homeassistant:
+    min_version: "2024.10.0"
   input:
     motion_entity:
       name: Motion Sensor
@@ -20,7 +31,7 @@ blueprint:
           min: 0
           max: 3600
           unit_of_measurement: seconds
-          
+
     sunset_offset:
       name: Offset to turn on lights
       description: Define offset to sunset
@@ -30,7 +41,7 @@ blueprint:
           min: 0
           max: 240
           unit_of_measurement: minutes
-          
+
     sunrise_offset:
       name: Offset to turn off lights
       description: Define offset to sunrise
@@ -41,41 +52,79 @@ blueprint:
           max: 240
           unit_of_measurement: minutes
 
-# If motion is detected within the delay,
-# we restart the script.
-mode: restart
+    recover_on_restart:
+      name: Recover after restart
+      description: >-
+        On Home Assistant startup, turn the light off if the motion sensor is
+        clear. Covers the case where motion ended while HA was down, but will
+        also turn off a light that was switched on by hand just before the
+        restart.
+      default: false
+      selector:
+        boolean:
+
+# Each run is instantaneous (a single turn_on or turn_off), so runs are queued
+# rather than restarted — no run is ever discarded mid-flight.
+mode: queued
+max: 10
 max_exceeded: silent
 
-trigger:
-  platform: state
-  entity_id: !input motion_entity
-  from: "off"
-  to: "on"
-  
-condition:
-  - condition: or
-    conditions:
-    - condition: sun
-      after: sunset
-      after_offset: !input sunset_offset
-    - condition: sun
-      before: sunrise
-      before_offset: !input sunrise_offset
+triggers:
+  - trigger: state
+    entity_id: !input motion_entity
+    to: "on"
+    id: motion_start
+  - trigger: state
+    entity_id: !input motion_entity
+    to: "off"
+    for:
+      seconds: !input no_motion_wait
+    id: motion_end
+    note: >-
+      The wait lives in the trigger, not in a delay. Motion returning during
+      the wait cancels this trigger, and the countdown is owned by the trigger
+      engine instead of an in-flight automation run.
+  - trigger: homeassistant
+    event: start
+    id: restart_recovery
+    enabled: !input recover_on_restart
 
-action:
-  - service: homeassistant.turn_on
-    entity_id: !input light_target
-  - alias: "Wait until there is no motion from device (skip if already off due to sensor chatter)"
-    if:
-      - condition: state
-        entity_id: !input motion_entity
-        state: "on"
-    then:
-      - wait_for_trigger:
-          platform: state
-          entity_id: !input motion_entity
-          from: "on"
-          to: "off"
-  - delay: !input no_motion_wait
-  - service: homeassistant.turn_off
-    entity_id: !input light_target
+actions:
+  - choose:
+      - alias: "Motion started after dark — turn on the light"
+        conditions:
+          - condition: trigger
+            id: motion_start
+          - condition: or
+            conditions:
+              - condition: sun
+                after: sunset
+                after_offset:
+                  minutes: !input sunset_offset
+              - condition: sun
+                before: sunrise
+                before_offset:
+                  minutes: !input sunrise_offset
+        sequence:
+          - action: homeassistant.turn_on
+            target:
+              entity_id: !input light_target
+      - alias: "Motion clear for the wait time — turn off the light"
+        conditions:
+          - condition: trigger
+            id: motion_end
+        sequence:
+          - action: homeassistant.turn_off
+            target:
+              entity_id: !input light_target
+      - alias: "Startup — clear a light left on across a restart"
+        conditions:
+          - condition: trigger
+            id: restart_recovery
+          - condition: state
+            entity_id: !input motion_entity
+            state: "off"
+        sequence:
+          - action: homeassistant.turn_off
+            target:
+              entity_id: !input light_target

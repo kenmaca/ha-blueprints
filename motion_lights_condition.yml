@@ -1,27 +1,31 @@
 blueprint:
   name: Motion-activated Light with external binary sensor condition
   description: >-
-    Turn on a light when motion is detected and an external binary sensor is on.
-    v2 (restart-safe): the turn-off is a state trigger with a `for:` duration
-    instead of an in-flight wait/delay, so it survives Home Assistant restarts
-    and automation reloads. The turn-off is also unconditional — it fires even
-    if the condition entity (e.g. dusk) has since turned off, so lights can't
-    get stuck on by a condition flip mid-cycle.
+    Turn on a light when motion is detected and an external binary sensor is
+    on, and turn it off once motion has been clear for the wait time.
+
+    Turning on and turning off are driven by separate triggers, so the
+    automation never holds an open run between the two. Nothing is left
+    dangling if the automation is reloaded, restarted, or interrupted
+    mid-delay. The binary sensor gates only the turn-on branch — the light
+    still turns off if that sensor goes off in the meantime.
   domain: automation
   source_url: https://github.com/kenmaca/ha-blueprints/blob/main/motion_lights_condition.yml
+  homeassistant:
+    min_version: "2024.10.0"
   input:
     motion_entity:
       name: Motion Sensor
       selector:
-        entity: {}
+        entity:
     light_target:
       name: Light
       selector:
-        entity: {}
+        entity:
     condition_entity:
       name: Binary Sensor
       selector:
-        entity: {}
+        entity:
     no_motion_wait:
       name: Wait time
       description: Time to leave the light on after last motion is detected
@@ -31,40 +35,72 @@ blueprint:
           min: 0
           max: 3600
           unit_of_measurement: seconds
-          step: 1
-          mode: slider
+    recover_on_restart:
+      name: Recover after restart
+      description: >-
+        On Home Assistant startup, turn the light off if the motion sensor is
+        clear. Covers the case where motion ended while HA was down, but will
+        also turn off a light that was switched on by hand just before the
+        restart.
+      default: false
+      selector:
+        boolean:
 
-mode: restart
+# Each run is instantaneous (a single turn_on or turn_off), so runs are queued
+# rather than restarted — no run is ever discarded mid-flight.
+mode: queued
+max: 10
 max_exceeded: silent
 
 triggers:
   - trigger: state
     entity_id: !input motion_entity
     to: "on"
-    id: motion_on
+    id: motion_start
   - trigger: state
     entity_id: !input motion_entity
     to: "off"
     for:
       seconds: !input no_motion_wait
-    id: motion_off
+    id: motion_end
+    note: >-
+      The wait lives in the trigger, not in a delay. Motion returning during
+      the wait cancels this trigger, and the countdown is owned by the trigger
+      engine instead of an in-flight automation run.
+  - trigger: homeassistant
+    event: start
+    id: restart_recovery
+    enabled: !input recover_on_restart
 
 actions:
   - choose:
-      - conditions:
+      - alias: "Motion started and the binary sensor is on — turn on the light"
+        conditions:
           - condition: trigger
-            id: motion_on
+            id: motion_start
           - condition: state
             entity_id: !input condition_entity
             state: "on"
         sequence:
-          - action: light.turn_on
+          - action: homeassistant.turn_on
             target:
               entity_id: !input light_target
-      - conditions:
+      - alias: "Motion clear for the wait time — turn off the light"
+        conditions:
           - condition: trigger
-            id: motion_off
+            id: motion_end
         sequence:
-          - action: light.turn_off
+          - action: homeassistant.turn_off
+            target:
+              entity_id: !input light_target
+      - alias: "Startup — clear a light left on across a restart"
+        conditions:
+          - condition: trigger
+            id: restart_recovery
+          - condition: state
+            entity_id: !input motion_entity
+            state: "off"
+        sequence:
+          - action: homeassistant.turn_off
             target:
               entity_id: !input light_target

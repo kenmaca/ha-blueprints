@@ -1,10 +1,21 @@
-#
-# Dims lights when media is played and reverts back to previous brightness when stopped/paused
-
 blueprint:
   name: Theatre-style Dimming
-  description: Dims lights when media is played and reverts back to previous brightness when stopped/paused
+  description: >-
+    Dim a light while media is playing and restore its previous brightness when
+    playback stops or pauses.
+
+    Dimming and restoring are driven by separate triggers, so the automation
+    never holds an open run between the two. Rapidly toggling play/pause cannot
+    interleave a dim with a restore, and nothing is left dangling if the
+    automation is reloaded or Home Assistant restarts mid-delay.
+
+    Every decision is re-derived from the light's current brightness rather than
+    from remembered run state, and the light is never sampled while a fade is
+    still in flight — so a snapshot can never capture a half-dimmed value.
   domain: automation
+  source_url: https://github.com/kenmaca/ha-blueprints/blob/main/theatre_style_dimming.yaml
+  homeassistant:
+    min_version: "2024.10.0"
   input:
     room_light:
       name: Light
@@ -22,18 +33,25 @@ blueprint:
 
     dimmed_brightness:
       name: Dimmed Brightness
+      description: >-
+        Brightness to dim to during playback. Cannot be 0 — a light turned fully
+        off has no state left to restore from.
       default: 10
       selector:
         number:
-          min: 0
+          min: 1
           max: 100
-          step: 5
+          step: 1
           unit_of_measurement: "%"
           mode: slider
 
     brightness_threshold:
       name: Brightness Threshold
-      description: Only dim if the current light brightness is above this level. Prevents re-dimming an already-dim light.
+      description: >-
+        Only dim if the current brightness is above this level. Prevents
+        re-dimming an already-dim light and, more importantly, prevents
+        snapshotting a light this automation has already dimmed. Always treated
+        as at least Dimmed Brightness + 10%, whatever is configured here.
       default: 20
       selector:
         number:
@@ -45,7 +63,9 @@ blueprint:
 
     ttd:
       name: Time-to-dim
-      description: Delay after media starts playing before dimming begins.
+      description: >-
+        How long media must stay playing before dimming. Leaving the playing
+        state during this window cancels the dim entirely.
       default: 3
       selector:
         number:
@@ -57,7 +77,10 @@ blueprint:
 
     ttr:
       name: Time-to-reset
-      description: Delay after media stops/pauses before restoring brightness. Smooths over brief pauses and buffering.
+      description: >-
+        How long media must stay stopped/paused before restoring. Smooths over
+        brief pauses and buffering; resuming during this window cancels the
+        restore entirely.
       default: 10
       selector:
         number:
@@ -79,78 +102,189 @@ blueprint:
           unit_of_measurement: "seconds"
           mode: slider
 
-mode: single
+    fallback_brightness:
+      name: Fallback Brightness
+      description: >-
+        Used when the light is dimmed but the saved snapshot is gone — snapshot
+        scenes do not survive a Home Assistant restart. Without this the light
+        would simply stay dim forever.
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          step: 5
+          unit_of_measurement: "%"
+          mode: slider
+
+    recover_on_restart:
+      name: Recover after restart
+      description: >-
+        On Home Assistant startup, restore a light that is sitting at the dimmed
+        level while media is not playing. Covers playback ending while HA was
+        down. Will also brighten a light genuinely left dim by hand before the
+        restart.
+      default: true
+      selector:
+        boolean:
+
+    dim_on_light_turn_on:
+      name: Dim a light switched on mid-playback
+      description: >-
+        If the light is switched on by hand while media is already playing, dim
+        it too. Off by default, so a light turned on mid-film stays bright until
+        the next play event.
+      default: false
+      selector:
+        boolean:
+
+# Each run is a short, self-contained dim or restore, so runs are queued rather
+# than restarted — no run is ever discarded mid-flight, and a restore can never
+# execute concurrently with a dim.
+mode: queued
+max: 10
+max_exceeded: silent
 
 variables:
   room_light: !input room_light
+  media_player: !input media_player
+  dimmed_brightness: !input dimmed_brightness
   brightness_threshold: !input brightness_threshold
+  dim_duration: !input dim_duration
+  ttd: !input ttd
+  ttr: !input ttr
 
-trigger:
-  - platform: state
+  # scene.create keys off the light, so every automation pointing at this light
+  # shares one snapshot rather than each keeping a divergent copy.
+  scene_entity: "scene.persistence_{{ room_light.split('.')[1] }}"
+
+  # Never snapshot a light that is already at (or near) the dimmed level, even
+  # if Brightness Threshold is misconfigured below Dimmed Brightness.
+  dim_floor: "{{ [brightness_threshold, dimmed_brightness + 10] | max }}"
+
+  # A light at or below this is treated as "we dimmed this", and is the only
+  # thing this blueprint will restore. Manually brightening during playback
+  # therefore opts the light out of the restore.
+  dim_ceiling: "{{ dimmed_brightness + 5 }}"
+
+  # Only wait if a fade could still be running. Normally zero; guards the case
+  # where the transition outlasts the trigger's own countdown, which is how a
+  # snapshot used to capture a mid-fade brightness.
+  dim_settle: "{{ [0, dim_duration - ttd] | max }}"
+  restore_settle: "{{ [0, dim_duration - ttr] | max }}"
+
+triggers:
+  - trigger: state
     entity_id: !input media_player
-    to: "playing"
+    to:
+      - "playing"
+      - "buffering"
+      - "on"
     for:
       seconds: !input ttd
-  - platform: state
+    id: media_start
+    note: >-
+      The countdown lives in the trigger, not in a delay. Pausing during the
+      window cancels this trigger outright, so a stale dim can never land on top
+      of a restore that has already run.
+
+  - trigger: state
     entity_id: !input media_player
-    to: "buffering"
+    to:
+      - "paused"
+      - "idle"
+      - "off"
+      - "standby"
+      - "unavailable"
+      - "unknown"
     for:
-      seconds: !input ttd
-  - platform: state
-    entity_id: !input media_player
+      seconds: !input ttr
+    id: media_stop
+    note: >-
+      Resuming during the window cancels this trigger, so a restore can never
+      fire after playback has already picked back up.
+
+  - trigger: state
+    entity_id: !input room_light
     to: "on"
     for:
       seconds: !input ttd
+    id: light_on
+    enabled: !input dim_on_light_turn_on
+    note: >-
+      Only fires on a genuine off -> on transition. Restoring brightness changes
+      an attribute, not the state, so this cannot feed back into itself.
 
-condition:
-  - condition: template
-    value_template: >
-      {{ is_state(room_light, 'on')
-         and (state_attr(room_light, 'brightness') | int(0))
-             > (brightness_threshold * 255 / 100) }}
+  - trigger: homeassistant
+    event: start
+    id: restart_recovery
+    enabled: !input recover_on_restart
 
-action:
-  - service: scene.create
-    data:
-      scene_id: "persistence_{{ room_light.split('.')[1] }}"
-      snapshot_entities: !input room_light
-  - service: light.turn_on
-    data:
-      brightness_pct: !input dimmed_brightness
-      transition: !input dim_duration
-    target:
-      entity_id: !input room_light
-  - delay:
-      seconds: !input dim_duration
-  - wait_for_trigger:
-      - platform: state
-        entity_id: !input media_player
-        to: "paused"
-        for:
-          seconds: !input ttr
-      - platform: state
-        entity_id: !input media_player
-        to: "idle"
-        for:
-          seconds: !input ttr
-      - platform: state
-        entity_id: !input media_player
-        to: "off"
-        for:
-          seconds: !input ttr
-      - platform: state
-        entity_id: !input media_player
-        to: "unavailable"
-        for:
-          seconds: !input ttr
-      - platform: state
-        entity_id: !input room_light
-        to: "off"
-  - if:
-      - condition: template
-        value_template: "{{ wait.trigger.to_state.entity_id != room_light }}"
-    then:
-      - service: scene.turn_on
-        data:
-          entity_id: "scene.persistence_{{ room_light.split('.')[1] }}"
-          transition: !input dim_duration
+actions:
+  - choose:
+      - alias: "Playback started — snapshot and dim"
+        conditions:
+          - condition: trigger
+            id:
+              - media_start
+              - light_on
+        sequence:
+          - alias: "Let any in-flight fade finish before reading brightness"
+            delay: "{{ dim_settle | float }}"
+          - alias: "Media is still playing"
+            condition: template
+            value_template: >-
+              {{ states(media_player) in ['playing', 'buffering', 'on'] }}
+          - alias: "The light is on and bright enough to be worth dimming"
+            condition: template
+            value_template: >-
+              {{ is_state(room_light, 'on')
+                 and ((state_attr(room_light, 'brightness') | int(0)) / 2.55) > dim_floor | float }}
+          - action: scene.create
+            data:
+              scene_id: "persistence_{{ room_light.split('.')[1] }}"
+              snapshot_entities: !input room_light
+          - action: light.turn_on
+            target:
+              entity_id: !input room_light
+            data:
+              brightness_pct: !input dimmed_brightness
+              transition: !input dim_duration
+
+      - alias: "Playback stopped — restore, or fall back if the snapshot is gone"
+        conditions:
+          - condition: trigger
+            id:
+              - media_stop
+              - restart_recovery
+        sequence:
+          - alias: "Let any in-flight fade finish before reading brightness"
+            delay: "{{ restore_settle | float }}"
+          - alias: "Media is still not playing"
+            condition: template
+            value_template: >-
+              {{ states(media_player) not in ['playing', 'buffering', 'on'] }}
+          - alias: "Only restore a light that is on and still sitting at the dimmed level"
+            condition: template
+            value_template: >-
+              {{ is_state(room_light, 'on')
+                 and ((state_attr(room_light, 'brightness') | int(0)) / 2.55) <= dim_ceiling | float }}
+          - choose:
+              - alias: "Snapshot exists — restore it"
+                conditions:
+                  - condition: template
+                    value_template: "{{ state_attr(scene_entity, 'entity_id') is not none }}"
+                sequence:
+                  - action: scene.turn_on
+                    target:
+                      entity_id: "{{ scene_entity }}"
+                    data:
+                      transition: !input dim_duration
+            default:
+              - alias: "Snapshot lost (typically a HA restart) — use the fallback"
+                action: light.turn_on
+                target:
+                  entity_id: !input room_light
+                data:
+                  brightness_pct: !input fallback_brightness
+                  transition: !input dim_duration

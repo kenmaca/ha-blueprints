@@ -9,6 +9,11 @@ blueprint:
     dangling if the automation is reloaded, restarted, or interrupted
     mid-delay. The sun condition gates only the turn-on branch — the light
     still turns off after sunrise.
+
+    Optional keep-on sensors let two automations share one light without
+    switching it off from under each other. They veto the turn-off while they
+    are on, and re-run the off-check when they clear, so the light is never
+    left stranded on.
   domain: automation
   source_url: https://github.com/kenmaca/ha-blueprints/blob/main/motion_lights_night.yaml
   homeassistant:
@@ -52,6 +57,21 @@ blueprint:
           max: 240
           unit_of_measurement: minutes
 
+    hold_entities:
+      name: Keep-on sensors
+      description: >-
+        Optional. While any of these entities is on, this automation will not
+        turn the light off. When the last one clears, the off-check runs again
+        after the wait time — so the light still turns off, it just waits for
+        the other occupancy source to release it.
+
+        Point this at the motion sensor of any other automation that shares
+        this light. Set it on both automations, each naming the other's sensor.
+      default: []
+      selector:
+        entity:
+          multiple: true
+
     recover_on_restart:
       name: Recover after restart
       description: >-
@@ -69,6 +89,9 @@ mode: queued
 max: 10
 max_exceeded: silent
 
+variables:
+  hold_entities: !input hold_entities
+
 triggers:
   - trigger: state
     entity_id: !input motion_entity
@@ -84,6 +107,17 @@ triggers:
       The wait lives in the trigger, not in a delay. Motion returning during
       the wait cancels this trigger, and the countdown is owned by the trigger
       engine instead of an in-flight automation run.
+  - trigger: state
+    entity_id: !input hold_entities
+    to: "off"
+    for:
+      seconds: !input no_motion_wait
+    id: hold_released
+    note: >-
+      A keep-on sensor releasing is a second chance to turn the light off. The
+      motion sensor's own off trigger may have already fired and been vetoed
+      while this sensor was on, and it will not fire again — without this
+      trigger the light would stay on indefinitely.
   - trigger: homeassistant
     event: start
     id: restart_recovery
@@ -109,10 +143,20 @@ actions:
           - action: homeassistant.turn_on
             target:
               entity_id: !input light_target
-      - alias: "Motion clear for the wait time — turn off the light"
+      - alias: "Motion clear and nothing holding the light — turn off the light"
         conditions:
-          - condition: trigger
-            id: motion_end
+          - condition: or
+            conditions:
+              - condition: trigger
+                id: motion_end
+              - condition: trigger
+                id: hold_released
+          - condition: state
+            entity_id: !input motion_entity
+            state: "off"
+          - condition: template
+            value_template: >-
+              {{ hold_entities | select('is_state', 'on') | list | count == 0 }}
         sequence:
           - action: homeassistant.turn_off
             target:
@@ -124,6 +168,9 @@ actions:
           - condition: state
             entity_id: !input motion_entity
             state: "off"
+          - condition: template
+            value_template: >-
+              {{ hold_entities | select('is_state', 'on') | list | count == 0 }}
         sequence:
           - action: homeassistant.turn_off
             target:

@@ -10,8 +10,10 @@ blueprint:
     automation is reloaded or Home Assistant restarts mid-delay.
 
     Every decision is re-derived from the light's current brightness rather than
-    from remembered run state, and the light is never sampled while a fade is
-    still in flight — so a snapshot can never capture a half-dimmed value.
+    from remembered run state. Because many bulbs report a new brightness back
+    to Home Assistant several seconds after being commanded, the automation
+    waits for the light to confirm its level before reading it and before
+    letting the next run start — so it never acts on a stale value.
   domain: automation
   source_url: https://github.com/kenmaca/ha-blueprints/blob/main/theatre_style_dimming.yaml
   homeassistant:
@@ -117,6 +119,24 @@ blueprint:
           unit_of_measurement: "%"
           mode: slider
 
+    settle_timeout:
+      name: Light Report Delay
+      description: >-
+        How long the light may take to report its real brightness back to Home
+        Assistant after being commanded. Many bulbs echo a new brightness
+        several seconds late, and acting on that stale value is what causes a
+        dim to be skipped or a wrong brightness to be saved. This is an upper
+        bound, not a fixed wait — the automation continues as soon as the light
+        reports. Raise it if your light is slow or polled.
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 60
+          step: 1
+          unit_of_measurement: "seconds"
+          mode: slider
+
     recover_on_restart:
       name: Recover after restart
       description: >-
@@ -153,6 +173,7 @@ variables:
   dim_duration: !input dim_duration
   ttd: !input ttd
   ttr: !input ttr
+  settle_timeout: !input settle_timeout
 
   # scene.create keys off the light, so every automation pointing at this light
   # shares one snapshot rather than each keeping a divergent copy.
@@ -231,6 +252,19 @@ actions:
         sequence:
           - alias: "Let any in-flight fade finish before reading brightness"
             delay: "{{ dim_settle | float }}"
+          - alias: "Wait for the light to report a bright level, in case it is still echoing a stale one"
+            wait_template: >-
+              {{ is_state(room_light, 'on')
+                 and ((state_attr(room_light, 'brightness') | int(0)) / 2.55) > dim_floor | float }}
+            timeout: "{{ settle_timeout | float }}"
+            continue_on_timeout: true
+            note: >-
+              A bulb often echoes its new brightness seconds after being
+              commanded. Reading the attribute immediately can return the value
+              from before the last restore, which used to abort this branch and
+              leave the light bright for the rest of playback. Resolves the
+              instant the light reports; the timeout only bounds a light that
+              is genuinely dim or off.
           - alias: "Media is still playing"
             condition: template
             value_template: >-
@@ -250,6 +284,16 @@ actions:
             data:
               brightness_pct: !input dimmed_brightness
               transition: !input dim_duration
+          - alias: "Hold the run open until the light confirms it is dim"
+            wait_template: >-
+              {{ not is_state(room_light, 'on')
+                 or ((state_attr(room_light, 'brightness') | int(0)) / 2.55) <= dim_ceiling | float }}
+            timeout: "{{ (dim_duration + settle_timeout) | float }}"
+            continue_on_timeout: true
+            note: >-
+              Queued mode plus this wait means the next run cannot start until
+              the light has reported the result of this one, so no run ever
+              reads a brightness that is about to change.
 
       - alias: "Playback stopped — restore, or fall back if the snapshot is gone"
         conditions:
@@ -260,6 +304,16 @@ actions:
         sequence:
           - alias: "Let any in-flight fade finish before reading brightness"
             delay: "{{ restore_settle | float }}"
+          - alias: "Wait for the light to report the dimmed level, in case it is still echoing a stale one"
+            wait_template: >-
+              {{ not is_state(room_light, 'on')
+                 or ((state_attr(room_light, 'brightness') | int(0)) / 2.55) <= dim_ceiling | float }}
+            timeout: "{{ settle_timeout | float }}"
+            continue_on_timeout: true
+            note: >-
+              Mirror of the dim branch. Without it, a restore fired shortly
+              after a dim could read the pre-dim brightness, decide the light
+              was never dimmed, and leave it dim indefinitely.
           - alias: "Media is still not playing"
             condition: template
             value_template: >-
@@ -288,3 +342,13 @@ actions:
                 data:
                   brightness_pct: !input fallback_brightness
                   transition: !input dim_duration
+          - alias: "Hold the run open until the light confirms it is no longer dim"
+            wait_template: >-
+              {{ not is_state(room_light, 'on')
+                 or ((state_attr(room_light, 'brightness') | int(0)) / 2.55) > dim_ceiling | float }}
+            timeout: "{{ (dim_duration + settle_timeout) | float }}"
+            continue_on_timeout: true
+            note: >-
+              Keeps a queued dim from starting while the light is still
+              reporting the old dimmed value — the exact case that used to
+              abort the dim and leave the light bright for the rest of playback.

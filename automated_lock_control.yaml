@@ -104,6 +104,31 @@ blueprint:
       selector:
         boolean:
 
+    refresh_before_unlock:
+      name: Re-check the door before auto-unlocking
+      description: >-
+        For locks whose door sensor can report late (e.g. Yale over Bluetooth,
+        where the "closed" report sometimes only arrives when Home Assistant next
+        talks to the lock). Before auto-unlocking, re-send "lock" to the
+        already-locked lock (the bolt does not move) so it reconnects and reports
+        its door sensor again, then wait for the door to read closed. Only if the
+        door still reads open does it unlock.
+      default: false
+      selector:
+        boolean:
+
+    refresh_wait:
+      name: Door re-check wait
+      description: Seconds to wait for a fresh "closed" door report after the re-check.
+      default: 20
+      selector:
+        number:
+          min: 5
+          max: 120
+          step: 5
+          unit_of_measurement: 'seconds'
+          mode: slider
+
     hold_unlocked:
       name: Hold unlocked while
       description: >-
@@ -128,6 +153,7 @@ variables:
   verify_timeout: !input verify_timeout
   retry_backoff: !input retry_backoff
   hold_entities: !input hold_unlocked
+  refresh_before_unlock: !input refresh_before_unlock
 
 # `mode: single` is load-bearing here. With `mode: restart`, a second trigger that
 # arrived while a `lock.lock` call was in-flight would cancel the HA task — but the
@@ -216,6 +242,30 @@ action:
           entity_id: !input lock
           state: 'locked'
       sequence:
+        # A stale door reading looks exactly like a real jam (door "open", lock
+        # "locked"), so it cannot be told apart from state alone. On 24 Sep 23:42 and
+        # 25 Sep 14:45 this branch unlocked a CLOSED front door: the Yale BLE door
+        # sensor's "closed" report only arrived 3-8 s after HA's unlock command
+        # made the lock reconnect. Re-sending "lock" to an already-locked lock
+        # forces that reconnect without moving the bolt.
+        - alias: 'Optionally re-check the door first: nudge the lock so it re-reports its door sensor'
+          if:
+            - condition: template
+              value_template: "{{ refresh_before_unlock }}"
+          then:
+            - alias: 'Re-send lock (already locked, bolt does not move)'
+              action: lock.lock
+              target:
+                entity_id: !input lock
+              continue_on_error: true
+            - alias: 'Wait for a fresh closed report'
+              wait_template: "{{ is_state(door_entity, 'off') }}"
+              timeout:
+                seconds: !input refresh_wait
+              continue_on_timeout: true
+            - alias: 'Still open and locked after the re-check: a real jam risk, carry on. Otherwise it was a stale reading'
+              condition: template
+              value_template: "{{ is_state(door_entity, 'on') and is_state(lock_entity, 'locked') }}"
         - alias: 'Issue unlock'
           action: lock.unlock
           target:

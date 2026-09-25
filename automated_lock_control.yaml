@@ -104,6 +104,20 @@ blueprint:
       selector:
         boolean:
 
+    hold_unlocked:
+      name: Hold unlocked while
+      description: >-
+        Optional. While any of these is on, auto-lock is paused (something else is
+        deliberately holding the door unlocked). Once they are all off, auto-lock
+        runs again after the time-to-lock.
+      default: []
+      selector:
+        entity:
+          domain:
+            - binary_sensor
+            - input_boolean
+          multiple: true
+
 # Surface inputs to Jinja so action templates and wait_templates can reference them.
 # Without this, `!input` values aren't visible inside `{{ ... }}`.
 variables:
@@ -113,6 +127,7 @@ variables:
   lock_entity: !input lock
   verify_timeout: !input verify_timeout
   retry_backoff: !input retry_backoff
+  hold_entities: !input hold_unlocked
 
 # `mode: single` is load-bearing here. With `mode: restart`, a second trigger that
 # arrived while a `lock.lock` call was in-flight would cancel the HA task — but the
@@ -145,14 +160,16 @@ trigger:
       - 'unknown'
     for:
       seconds: !input ttu
-  # Door has been closed for ttl — auto-lock candidate.
+  # Door has been closed for ttl — auto-lock candidate. Unlike the ttu triggers,
+  # the auto-lock triggers DO fire when the entity comes back from unavailable:
+  # otherwise a restart (or a lock dropping offline) while the door is unlocked
+  # leaves it unlocked indefinitely, because nothing changes again afterwards.
+  # The global condition and the branch's state checks still refuse to act on
+  # a degraded entity, and locking is the safe direction.
   - platform: state
     id: door_closed_for_ttl
     entity_id: !input door
     to: 'off'
-    not_from:
-      - 'unavailable'
-      - 'unknown'
     for:
       seconds: !input ttl
   # Lock has been unlocked for ttl — auto-lock candidate (covers the "unlocked but
@@ -161,9 +178,13 @@ trigger:
     id: lock_unlocked_for_ttl
     entity_id: !input lock
     to: 'unlocked'
-    not_from:
-      - 'unavailable'
-      - 'unknown'
+    for:
+      seconds: !input ttl
+  # A hold entity was released and has stayed off for ttl — auto-lock candidate.
+  - platform: state
+    id: hold_released_for_ttl
+    entity_id: !input hold_unlocked
+    to: 'off'
     for:
       seconds: !input ttl
 
@@ -229,6 +250,9 @@ action:
       conditions:
         - condition: template
           value_template: "{{ enable_auto_lock }}"
+        - alias: 'Nothing is holding the door unlocked'
+          condition: template
+          value_template: "{{ hold_entities | select('is_state', 'on') | list | count == 0 }}"
         - condition: state
           entity_id: !input door
           state: 'off'

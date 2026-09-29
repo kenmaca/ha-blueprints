@@ -112,7 +112,10 @@ blueprint:
         talks to the lock). Before auto-unlocking, re-send "lock" to the
         already-locked lock (the bolt does not move) so it reconnects and reports
         its door sensor again, then wait for the door to read closed. Only if the
-        door still reads open does it unlock.
+        door still reads open does it unlock. Skipped when the door opened after
+        the lock last reported locked: then the lock's own state is the stale one
+        (the bolt must have been retracted for the door to open), so "lock" would
+        really throw the bolt and the unlock goes ahead instead.
       default: false
       selector:
         boolean:
@@ -242,6 +245,15 @@ action:
           entity_id: !input lock
           state: 'locked'
       sequence:
+        # Which reading is stale? A door can only open while the bolt is retracted,
+        # so if the door opened AFTER the lock last reported "locked", the lock's
+        # state is the stale one: it was unlocked by hand and never reported it
+        # (29 Sep 17:41: hand unlock and door open never reported; the refresh below
+        # re-sent "lock" and really threw the bolt). Unlocking is then a no-op for
+        # the bolt and just corrects HA's state. If the lock went "locked" while the
+        # door already read open, it is either a real jam or a stale door reading.
+        - variables:
+            lock_is_stale: "{% set d = states[door_entity] %}{% set l = states[lock_entity] %}{{ d is not none and l is not none and d.last_changed > l.last_changed }}"
         # A stale door reading looks exactly like a real jam (door "open", lock
         # "locked"), so it cannot be told apart from state alone. On 24 Sep 23:42 and
         # 25 Sep 14:45 this branch unlocked a CLOSED front door: the Yale BLE door
@@ -251,7 +263,7 @@ action:
         - alias: 'Optionally re-check the door first: nudge the lock so it re-reports its door sensor'
           if:
             - condition: template
-              value_template: "{{ refresh_before_unlock }}"
+              value_template: "{{ refresh_before_unlock and not (lock_is_stale | bool) }}"
           then:
             - alias: 'Re-send lock (already locked, bolt does not move)'
               action: lock.lock
@@ -263,9 +275,15 @@ action:
               timeout:
                 seconds: !input refresh_wait
               continue_on_timeout: true
-            - alias: 'Still open and locked after the re-check: a real jam risk, carry on. Otherwise it was a stale reading'
-              condition: template
-              value_template: "{{ is_state(door_entity, 'on') and is_state(lock_entity, 'locked') }}"
+            # Must be a stop: a failing condition here would only end this if/then
+            # block and the unlock below would still run (29 Sep 17:43:05: the
+            # re-check found the door closed and it unlocked anyway).
+            - alias: 'Still open and locked after the re-check: a real jam risk, carry on. Otherwise it was a stale reading: stop'
+              if:
+                - condition: template
+                  value_template: "{{ not (is_state(door_entity, 'on') and is_state(lock_entity, 'locked')) }}"
+              then:
+                - stop: 'Re-check: the door reads closed (or the lock no longer reads locked), not a jam'
         - alias: 'Issue unlock'
           action: lock.unlock
           target:

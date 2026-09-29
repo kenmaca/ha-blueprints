@@ -1,88 +1,177 @@
 blueprint:
   name: "Maintenance Mode (forced light state)"
-  description: >
-    This blueprint captures the current state of selected lights before cleaning begins,
-    continuously forces them on during cleaning (if an optional additional condition is met),
-    and then restores the previous state when cleaning stops.
-    Instead of computing a unique scene id automatically, you provide a scene slug (without the "scene." prefix)
-    to be used for the snapshot. Ensure this scene id is unique per automation instance.
+  description: >-
+    Keep a set of lights on while a robot vacuum or mop is cleaning, then turn
+    off again the ones this automation switched on once cleaning stops.
+
+    Restart-safe. There is no loop, no delay and no in-memory scene, so nothing
+    is left dangling if Home Assistant restarts or the automation reloads
+    mid-clean. Every run is a single instantaneous step:
+
+    - Cleaning starts, a condition sensor turns on, or a managed light is
+      switched off while cleaning: each managed light that is off is added to
+      the Restore list, then turned on.
+
+    - Cleaning stops (or the cleaning sensor has been unavailable for 5
+      minutes): every light in the Restore list is turned off and the list is
+      cleared.
+
+    - Home Assistant starts: both checks run against the current state, so a
+      restart mid-clean resumes, and a clean that ended while HA was down is
+      still tidied up.
+
+    The Restore list is an input_text helper, so it survives restarts, which a
+    scene.create snapshot cannot do. A light that was already on when
+    cleaning started, and stayed on, is never touched at the end.
   domain: automation
+  source_url: https://github.com/kenmaca/ha-blueprints/blob/main/maintenance_mode.yaml
+  homeassistant:
+    min_version: "2024.10.0"
   input:
     cleaning_sensor:
-      name: Vacuum Cleaning Sensor
-      description: "Select the binary sensor that indicates your vacuum is cleaning."
+      name: Cleaning sensor
+      description: Binary sensor that is on while the robot is cleaning.
       selector:
         entity:
           domain: binary_sensor
     lights:
-      name: Lights to Manage
-      description: "Select one or more lights to manage during cleaning."
+      name: Lights to keep on
       selector:
-        target:
-          entity:
-            domain: light
-    check_interval:
-      name: Check Interval
-      description: "Interval in seconds between checks to reassert that the lights are on."
-      default: 5
+        entity:
+          domain: light
+          multiple: true
+    condition_entities:
+      name: Only while these are on
+      description: >-
+        Optional. The lights are forced on only while every one of these
+        entities is on (for example a "dim outside" sensor, or a bedroom door
+        contact). If one turns on part-way through a clean, the lights come on
+        then. Leave empty to always force the lights on while cleaning.
+      default: []
       selector:
-        number:
-          min: 1
-          max: 60
-          unit_of_measurement: seconds
-    additional_condition:
-      name: Additional Condition
-      description: >
-        Optional template condition that must evaluate to true for the lights to be kept on.
-        For example:
-        ```
-        is_state('binary_sensor.door', 'off') and is_state('sun.sun', 'below_horizon')
-        ```
-        Defaults to `true` if not specified.
-      default: "true"
+        entity:
+          multiple: true
+    restore_helper:
+      name: Restore list
+      description: >-
+        An input_text helper (max length 255) used only by this automation. It
+        records which lights this automation switched on so they can be
+        switched off again, even across a restart. Give each automation its
+        own helper.
       selector:
-        text:
-          multiline: true
-    snapshot_scene:
-      name: Snapshot Scene (slug)
-      description: >
-        Provide a unique scene slug (without the "scene." prefix) that will be used to capture the
-        current state of the lights before cleaning begins. This scene is later activated to restore the state.
-      default: "robot_cleaning_restore"
-      selector:
-        text:
+        entity:
+          domain: input_text
 
-trigger:
-  - platform: state
+# Each run is instantaneous, so runs are queued rather than restarted: no run
+# is discarded mid-flight, and Restore-list updates never race each other.
+mode: queued
+max: 10
+max_exceeded: silent
+
+variables:
+  cleaning_sensor: !input cleaning_sensor
+  lights: !input lights
+  condition_entities: !input condition_entities
+  restore_helper: !input restore_helper
+
+triggers:
+  - trigger: state
     entity_id: !input cleaning_sensor
     to: "on"
+    id: cleaning_started
+  - trigger: state
+    entity_id: !input cleaning_sensor
+    to: "off"
+    id: cleaning_stopped
+  - trigger: state
+    entity_id: !input cleaning_sensor
+    to:
+      - unavailable
+      - unknown
+    for:
+      minutes: 5
+    id: cleaning_stopped
+    note: >-
+      If the robot integration drops out mid-clean, treat it as stopped once
+      it has been gone for 5 minutes rather than holding the lights on
+      indefinitely. A shorter blip is ignored.
+  - trigger: state
+    entity_id: !input lights
+    to: "off"
+    id: light_turned_off
+    note: >-
+      Replaces the old 60-second re-assert loop: a motion automation or a
+      person switching a managed light off mid-clean turns it straight back
+      on.
+  - trigger: state
+    entity_id: !input condition_entities
+    to: "on"
+    id: condition_met
+  - trigger: homeassistant
+    event: start
+    id: startup
 
-action:
-  # Create a snapshot scene of the selected lights.
-  - service: scene.create
-    data:
-      scene_id: !input snapshot_scene
-      snapshot_entities: '{{ lights.entity_id }}'
-  # While cleaning is active, reassert that the lights remain on if the additional condition is met.
-  - repeat:
-      while:
-        - condition: state
-          entity_id: !input cleaning_sensor
-          state: "on"
-      sequence:
-        - choose:
-            - conditions:
-                - condition: template
-                  value_template: '{{ additional_condition }}'
-              sequence:
-                - service: light.turn_on
-                  target: !input lights
-          default: []
-        - delay:
-            seconds: !input check_interval
-  # When cleaning stops, restore the lights' previous state.
-  - service: scene.turn_on
-    data:
-      scene: 'scene.{{ snapshot_scene }}'
-
-mode: single
+actions:
+  # Only inputs are read here (from the automation-level block above), never
+  # a sibling key of this block.
+  - variables:
+      cleaning: "{{ is_state(cleaning_sensor, 'on') }}"
+      stopped: "{{ is_state(cleaning_sensor, 'off') }}"
+      conditions_met: >-
+        {{ condition_entities | reject('is_state', 'on') | list | count == 0 }}
+      recorded: >-
+        {{ states(restore_helper).split(',') | map('trim')
+           | select('match', 'light\.') | list }}
+  - choose:
+      - alias: "Cleaning and conditions met — record and turn on the managed lights that are off"
+        conditions:
+          - condition: trigger
+            id:
+              - cleaning_started
+              - light_turned_off
+              - condition_met
+              - startup
+          - condition: template
+            value_template: "{{ cleaning and conditions_met }}"
+        sequence:
+          - variables:
+              to_force: "{{ lights | select('is_state', 'off') | list }}"
+          - condition: template
+            value_template: "{{ to_force | count > 0 }}"
+          # Record before switching on: if HA stops between the two steps, the
+          # worst case is turning off a light that is already off.
+          - action: input_text.set_value
+            target:
+              entity_id: !input restore_helper
+            data:
+              value: "{{ (recorded + to_force) | unique | join(',') }}"
+          - action: light.turn_on
+            target:
+              entity_id: "{{ to_force }}"
+      - alias: "Cleaning over — turn off the lights this automation switched on"
+        conditions:
+          - condition: or
+            conditions:
+              - condition: and
+                conditions:
+                  - condition: trigger
+                    id: cleaning_stopped
+                  - condition: template
+                    value_template: "{{ not cleaning }}"
+              - condition: and
+                conditions:
+                  - condition: trigger
+                    id: startup
+                  - condition: template
+                    value_template: "{{ stopped }}"
+          - condition: template
+            value_template: "{{ recorded | count > 0 }}"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: "{{ recorded }}"
+          - action: input_text.set_value
+            target:
+              entity_id: !input restore_helper
+            data:
+              value: ""

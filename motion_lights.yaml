@@ -13,6 +13,11 @@ blueprint:
     switching it off from under each other. They veto the turn-off while they
     are on, and re-run the off-check when they clear, so the light is never
     left stranded on.
+
+    Optional turn-on conditions (And / Or / Not, state, sun, time, template…)
+    gate turning the light on only; they never stop it turning off. They are
+    checked at motion start only, so a condition that starts passing while
+    motion is ongoing does not turn the light on.
   domain: automation
   source_url: https://github.com/kenmaca/ha-blueprints/blob/main/motion_lights.yaml
   homeassistant:
@@ -49,6 +54,16 @@ blueprint:
       selector:
         entity:
           multiple: true
+    turn_on_conditions:
+      name: Only turn on when
+      description: >-
+        Optional. Conditions checked when motion starts; the light turns on only if
+        all of them pass (use And / Or / Not blocks for anything richer). They gate
+        turn-on only — the light still turns off when motion clears, even if these
+        stop passing. Leave empty to always turn on.
+      default: []
+      selector:
+        condition: {}
     recover_on_restart:
       name: Recover after restart
       description: >-
@@ -106,6 +121,8 @@ actions:
         conditions:
           - condition: trigger
             id: motion_start
+          - condition: and
+            conditions: !input turn_on_conditions
         sequence:
           - action: homeassistant.turn_on
             target:

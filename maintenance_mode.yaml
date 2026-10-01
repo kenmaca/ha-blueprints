@@ -8,7 +8,7 @@ blueprint:
     is left dangling if Home Assistant restarts or the automation reloads
     mid-clean. Every run is a single instantaneous step:
 
-    - Cleaning starts, a condition sensor turns on, or a managed light is
+    - Cleaning starts, a re-check entity changes, or a managed light is
       switched off while cleaning: each managed light that is off is added to
       the Restore list, then turned on.
 
@@ -40,13 +40,20 @@ blueprint:
         entity:
           domain: light
           multiple: true
-    condition_entities:
-      name: Only while these are on
+    force_conditions:
+      name: Only while
       description: >-
-        Optional. The lights are forced on only while every one of these
-        entities is on (for example a "dim outside" sensor, or a bedroom door
-        contact). If one turns on part-way through a clean, the lights come on
-        then. Leave empty to always force the lights on while cleaning.
+        Optional. The lights are forced on only while all of these conditions pass.
+        Leave empty to always force the lights on while cleaning.
+      default: []
+      selector:
+        condition: {}
+    recheck_entities:
+      name: Re-check when these change
+      description: >-
+        Optional. Any state change of these entities re-evaluates "Only while", so the
+        lights come on part-way through a clean when the conditions start passing.
+        List every entity your conditions read.
       default: []
       selector:
         entity:
@@ -71,7 +78,6 @@ max_exceeded: silent
 variables:
   cleaning_sensor: !input cleaning_sensor
   lights: !input lights
-  condition_entities: !input condition_entities
   restore_helper: !input restore_helper
 
 triggers:
@@ -104,9 +110,12 @@ triggers:
       person switching a managed light off mid-clean turns it straight back
       on.
   - trigger: state
-    entity_id: !input condition_entities
-    to: "on"
-    id: condition_met
+    entity_id: !input recheck_entities
+    to: ~
+    id: recheck
+    note: >-
+      Any state change (attributes ignored), not just "on": a Not condition
+      starts passing when an entity turns off.
   - trigger: homeassistant
     event: start
     id: startup
@@ -117,8 +126,6 @@ actions:
   - variables:
       cleaning: "{{ is_state(cleaning_sensor, 'on') }}"
       stopped: "{{ is_state(cleaning_sensor, 'off') }}"
-      conditions_met: >-
-        {{ condition_entities | reject('is_state', 'on') | list | count == 0 }}
       recorded: >-
         {{ states(restore_helper).split(',') | map('trim')
            | select('match', 'light\.') | list }}
@@ -129,10 +136,12 @@ actions:
             id:
               - cleaning_started
               - light_turned_off
-              - condition_met
+              - recheck
               - startup
           - condition: template
-            value_template: "{{ cleaning and conditions_met }}"
+            value_template: "{{ cleaning }}"
+          - condition: and
+            conditions: !input force_conditions
         sequence:
           - variables:
               to_force: "{{ lights | select('is_state', 'off') | list }}"

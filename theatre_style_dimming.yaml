@@ -14,6 +14,9 @@ blueprint:
     to Home Assistant several seconds after being commanded, the automation
     waits for the light to confirm its level before reading it and before
     letting the next run start — so it never acts on a stale value.
+
+    Optional conditions gate every dim and restore, so the light can be left
+    alone while they fail (e.g. while someone has set it by hand).
   domain: automation
   source_url: https://github.com/kenmaca/ha-blueprints/blob/main/theatre_style_dimming.yaml
   homeassistant:
@@ -148,6 +151,18 @@ blueprint:
       selector:
         boolean:
 
+    act_conditions:
+      name: Only dim or restore when
+      description: >-
+        Optional. Conditions checked before every dim and every restore; the
+        automation leaves the light alone unless all of them pass (use And /
+        Or / Not blocks for anything richer). Typical use: a Not block on a
+        manual-control hold, so a light someone has set by hand is neither
+        dimmed nor brightened. Leave empty to always act.
+      default: []
+      selector:
+        condition: {}
+
     dim_on_light_turn_on:
       name: Dim a light switched on mid-playback
       description: >-
@@ -249,6 +264,8 @@ actions:
             id:
               - media_start
               - light_on
+          - condition: and
+            conditions: !input act_conditions
         sequence:
           - alias: "Let any in-flight fade finish before reading brightness"
             delay: "{{ dim_settle | float }}"
@@ -301,6 +318,8 @@ actions:
             id:
               - media_stop
               - restart_recovery
+          - condition: and
+            conditions: !input act_conditions
         sequence:
           - alias: "Let any in-flight fade finish before reading brightness"
             delay: "{{ restore_settle | float }}"
